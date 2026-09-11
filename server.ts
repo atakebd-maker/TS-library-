@@ -53,7 +53,7 @@ Respond with JSON only:
       }
     });
 
-    const resultText = response.text();
+    const resultText = response.text || "";
     if (!resultText) {
       throw new Error("Empty response from model");
     }

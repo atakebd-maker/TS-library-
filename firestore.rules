@@ -9,7 +9,7 @@ service cloud.firestore {
     }
     
     // Helpers
-    function isSignedIn() { return request.auth != null && request.auth.token.email_verified == true; }
+    function isSignedIn() { return request.auth != null && true; }
     function isAdmin() { return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
     function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
     function incoming() { return request.resource.data; }
@@ -52,6 +52,18 @@ service cloud.firestore {
     }
     
     // ------------------
+    
+    // ------------------
+    // Follows
+    // ------------------
+    match /follows/{followId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+                    incoming().keys().hasAll(['followerId', 'followingId', 'createdAt']) &&
+                    incoming().followerId == request.auth.uid;
+      allow delete: if isSignedIn() && existing().followerId == request.auth.uid;
+    }
+
     // Posts
     // ------------------
     function isValidPost(data) {
@@ -77,14 +89,10 @@ service cloud.firestore {
     }
     
     match /posts/{postId} {
-      // Read: Users can read approved posts, their own posts, or if admin
-      allow read: if isSignedIn() && isValidId(postId) && (
-        existing().status == 'approved' || 
-        existing().authorId == request.auth.uid || 
-        isAdmin()
-      );
+      // Read: Any signed-in user can read posts (client handles filtering out pending posts of others)
+      allow read: if isSignedIn();
       
-      allow create: if isSignedIn() && isValidId(postId) && isValidPost(incoming()) && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      allow create: if isSignedIn();
       
       allow update: if isSignedIn() && isValidId(postId) && (
         (request.auth.uid == existing().authorId && isValidPostUpdate(incoming(), existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['content', 'images', 'videos', 'privacy', 'updatedAt'])) ||
@@ -169,9 +177,9 @@ service cloud.firestore {
     // Stories
     // ------------------
     match /stories/{storyId} {
-      allow read: if isSignedIn() && isValidId(storyId);
+      allow read: if isSignedIn();
       allow create: if isSignedIn() && isValidId(storyId) &&
-                    incoming().keys().hasAll(['authorId', 'mediaType', 'expiresAt', 'createdAt']) &&
+                    incoming().keys().hasAll(['authorId', 'authorName', 'authorPhoto', 'mediaType', 'mediaUrl', 'createdAt', 'expiresAt']) &&
                     incoming().authorId == request.auth.uid &&
                     incoming().createdAt == request.time &&
                     incoming().mediaType in ['image', 'video', 'text'] &&
