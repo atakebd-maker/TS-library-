@@ -1,0 +1,183 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+    
+    // Helpers
+    function isSignedIn() { return request.auth != null && request.auth.token.email_verified == true; }
+    function isAdmin() { return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    
+    // ------------------
+    // Users
+    // ------------------
+    function isValidUser(data) {
+      return data.keys().hasAll(['name', 'email', 'createdAt']) &&
+             data.name is string && data.name.size() <= 100 &&
+             data.email is string && data.email.size() <= 150 &&
+             data.createdAt == request.time &&
+             (data.get('photoURL', '') is string && data.get('photoURL', '').size() <= 500) &&
+             (data.get('bio', '') is string && data.get('bio', '').size() <= 500) &&
+             (data.get('friendsCount', 0) is number) &&
+             (data.get('followersCount', 0) is number) &&
+             (data.get('followingCount', 0) is number) &&
+             (data.get('isAdmin', false) is bool && data.get('isAdmin', false) == false) && // Users cannot set themselves as admin
+             (data.get('isBanned', false) is bool && data.get('isBanned', false) == false);
+    }
+    
+    function isValidUserUpdate(data, current) {
+      return data.name is string && data.name.size() <= 100 &&
+             (data.get('photoURL', '') is string && data.get('photoURL', '').size() <= 500) &&
+             (data.get('bio', '') is string && data.get('bio', '').size() <= 500) &&
+             data.email == current.email && 
+             data.createdAt == current.createdAt &&
+             data.get('isAdmin', false) == current.get('isAdmin', false) &&
+             data.get('isBanned', false) == current.get('isBanned', false);
+    }
+    
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isSignedIn() && isValidId(userId) && (
+        (request.auth.uid == userId && isValidUserUpdate(incoming(), existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'photoURL', 'bio', 'friendsCount', 'followersCount', 'followingCount'])) ||
+        isAdmin()
+      );
+    }
+    
+    // ------------------
+    // Posts
+    // ------------------
+    function isValidPost(data) {
+      return data.keys().hasAll(['authorId', 'privacy', 'status', 'createdAt']) &&
+             data.authorId == request.auth.uid &&
+             data.privacy in ['public', 'friends', 'only_me'] &&
+             data.status in ['pending', 'approved'] &&
+             data.createdAt == request.time &&
+             (data.get('content', '') is string && data.get('content', '').size() <= 5000) &&
+             (data.get('images', []) is list && data.get('images', []).size() <= 10) &&
+             (data.get('videos', []) is list && data.get('videos', []).size() <= 2) &&
+             (data.get('likesCount', 0) is number && data.get('likesCount', 0) == 0) &&
+             (data.get('commentsCount', 0) is number && data.get('commentsCount', 0) == 0) &&
+             (data.get('sharesCount', 0) is number && data.get('sharesCount', 0) == 0);
+    }
+    
+    function isValidPostUpdate(data, current) {
+      return data.authorId == current.authorId &&
+             data.createdAt == current.createdAt &&
+             data.privacy in ['public', 'friends', 'only_me'] &&
+             data.updatedAt == request.time &&
+             (data.get('content', '') is string && data.get('content', '').size() <= 5000);
+    }
+    
+    match /posts/{postId} {
+      // Read: Users can read approved posts, their own posts, or if admin
+      allow read: if isSignedIn() && isValidId(postId) && (
+        existing().status == 'approved' || 
+        existing().authorId == request.auth.uid || 
+        isAdmin()
+      );
+      
+      allow create: if isSignedIn() && isValidId(postId) && isValidPost(incoming()) && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      
+      allow update: if isSignedIn() && isValidId(postId) && (
+        (request.auth.uid == existing().authorId && isValidPostUpdate(incoming(), existing()) && incoming().diff(existing()).affectedKeys().hasOnly(['content', 'images', 'videos', 'privacy', 'updatedAt'])) ||
+        // Counter updates (any signed in user can theoretically like/comment, but we'd rather use Cloud Functions or atomic increments if needed. Allowing limited field update here)
+        (incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'commentsCount', 'sharesCount'])) ||
+        // Server side (or Admin) can update status
+        isAdmin()
+      );
+      
+      allow delete: if isSignedIn() && isValidId(postId) && (request.auth.uid == existing().authorId || isAdmin());
+      
+      // Comments Subcollection
+      match /comments/{commentId} {
+        allow read: if isSignedIn() && isValidId(postId);
+        allow create: if isSignedIn() && isValidId(commentId) &&
+                      incoming().keys().hasAll(['authorId', 'content', 'createdAt']) &&
+                      incoming().authorId == request.auth.uid &&
+                      incoming().content is string && incoming().content.size() > 0 && incoming().content.size() <= 1000 &&
+                      incoming().createdAt == request.time &&
+                      exists(/databases/$(database)/documents/posts/$(postId));
+        allow delete: if isSignedIn() && isValidId(commentId) && (request.auth.uid == existing().authorId || isAdmin());
+      }
+    }
+    
+    // ------------------
+    // Conversations
+    // ------------------
+    match /conversations/{conversationId} {
+      allow read: if isSignedIn() && isValidId(conversationId) && request.auth.uid in existing().participants;
+      allow create: if isSignedIn() && isValidId(conversationId) &&
+                    incoming().keys().hasAll(['participants', 'updatedAt']) &&
+                    incoming().participants is list && incoming().participants.size() == 2 &&
+                    request.auth.uid in incoming().participants &&
+                    incoming().updatedAt == request.time;
+      allow update: if isSignedIn() && isValidId(conversationId) && request.auth.uid in existing().participants &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['lastMessage', 'updatedAt']) &&
+                    incoming().updatedAt == request.time;
+                    
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && isValidId(conversationId) && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+        allow create: if isSignedIn() && isValidId(messageId) &&
+                      request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants &&
+                      incoming().keys().hasAll(['senderId', 'createdAt']) &&
+                      incoming().senderId == request.auth.uid &&
+                      incoming().createdAt == request.time &&
+                      (incoming().get('text', '') is string && incoming().get('text', '').size() <= 2000) &&
+                      (incoming().get('imageUrl', '') is string && incoming().get('imageUrl', '').size() <= 500);
+      }
+    }
+    
+    // ------------------
+    // Notifications
+    // ------------------
+    match /users/{userId}/notifications/{notificationId} {
+      allow read: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      // Anyone can create a notification for another user
+      allow create: if isSignedIn() && isValidId(notificationId) &&
+                    incoming().keys().hasAll(['type', 'message', 'isRead', 'createdAt']) &&
+                    incoming().type is string && incoming().type.size() <= 50 &&
+                    incoming().message is string && incoming().message.size() <= 500 &&
+                    incoming().isRead == false &&
+                    incoming().createdAt == request.time;
+      allow update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+    }
+    
+    // ------------------
+    // Reports
+    // ------------------
+    match /reports/{reportId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn() && isValidId(reportId) &&
+                    incoming().keys().hasAll(['reporterId', 'reportedId', 'type', 'status', 'createdAt']) &&
+                    incoming().reporterId == request.auth.uid &&
+                    incoming().status == 'pending' &&
+                    incoming().createdAt == request.time &&
+                    incoming().type is string && incoming().type.size() <= 50;
+      allow update: if isAdmin();
+    }
+    
+    // ------------------
+    // Stories
+    // ------------------
+    match /stories/{storyId} {
+      allow read: if isSignedIn() && isValidId(storyId);
+      allow create: if isSignedIn() && isValidId(storyId) &&
+                    incoming().keys().hasAll(['authorId', 'mediaType', 'expiresAt', 'createdAt']) &&
+                    incoming().authorId == request.auth.uid &&
+                    incoming().createdAt == request.time &&
+                    incoming().mediaType in ['image', 'video', 'text'] &&
+                    exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      allow delete: if isSignedIn() && isValidId(storyId) && (request.auth.uid == existing().authorId || isAdmin());
+    }
+
+  }
+}
